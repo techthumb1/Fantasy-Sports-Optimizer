@@ -2,29 +2,33 @@ import os
 import requests
 import pandas as pd
 import json
-import numpy as np 
-import xgboost as xgb
+import joblib
+import logging
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
-import tensorflow as tf
+from flask import Flask, jsonify, request, Response
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Column, Integer, String, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from backend.api.sleeper import SleeperAPI
 from backend.api.espn import ESPNAPI
 from backend.utils.preprocessing import preprocess_data
-from backend.utils.feature_engineering import apply_feature_engineering
-from backend.models.xgboost_model import xgboost_model
-from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+from backend.models.train_models import train_ensemble_model, train_xgboost_model
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from backend.utils.formatter import pretty_print_json
+from backend.api.player_endpoints import PlayerEndpoint
+from backend.utils.data_fetching import fetch_live_teams_data, fetch_live_scores_data
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import atexit
+from backend.routes import sleeper_routes
+from backend.utils.data_updates import update_nfl_data, update_nba_data, update_college_data
+from backend.utils.cache import load_cache, save_cache
+from backend.utils.data_fetching import fetch_live_nfl_teams_data, fetch_live_nfl_scores_data, fetch_live_nba_teams_data, fetch_live_nba_scores_data, fetch_live_cfb_teams_data, fetch_live_cfb_scores_data
+from backend.utils.data_preprocessing import process_nfl_teams_data, process_nfl_scores_data, process_cfb_teams_data, process_cfb_scores_data, process_nba_teams_data, process_nba_scores_data
 
 
 
-
+# Initialize the Flask app
 app = Flask(__name__)
 
 # Configuration for SQLite
@@ -32,6 +36,13 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///sports_optimizer.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
+
+# Register Blueprints
+app.register_blueprint(sleeper_routes)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Define User model
 class User(db.Model):
@@ -51,713 +62,550 @@ def init_db():
         else:
             print("Database already exists.")
 
-# Initialize the database
 init_db()
 
 # Load environment variables
 load_dotenv()
 
+# Initialize the scheduler
+scheduler = BackgroundScheduler()
+
 # Define absolute paths for data
-teams_file_path = os.path.join(os.path.dirname(__file__), 'teams_data.json')
-scores_file_path = os.path.join(os.path.dirname(__file__), 'scores_data.json')
+#teams_file_path = os.path.join(os.path.dirname(__file__), 'teams_data.json')
+#scores_file_path = os.path.join(os.path.dirname(__file__), 'scores_data.json')
 
-'***********************************************************************'
-'''APIs'''
-class SleeperAPI:
-    SLEEPER_BASE_URL = "https://api.sleeper.app/v1"
+def get_live_teams_and_scores_data():
+    teams_data = fetch_live_teams_data()
+    scores_data = fetch_live_scores_data()
+    return teams_data, scores_data
 
-    @staticmethod
-    def get_trending_players(sport, trend_type="add", lookback_hours=24, limit=25):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/players/{sport}/trending/{trend_type}"
-        params = {"lookback_hours": lookback_hours, "limit": limit}
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch trending players: {response.status_code}")
-            return None
+# Initialize Sleeper API client
+sleeper_client = SleeperAPI()
+player_endpoint = PlayerEndpoint(client=sleeper_client)
+espn_client = ESPNAPI()
 
-    @staticmethod
-    def get_players(sport):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/players/{sport}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch players: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_player_stats(player_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/player/{player_id}/stats"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch player stats: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_user(username_or_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/user/{username_or_id}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch user data: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_leagues(user_id, sport, season):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/user/{user_id}/leagues/{sport}/{season}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch leagues: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_league(league_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/league/{league_id}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch league data: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_rosters(league_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/league/{league_id}/rosters"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch rosters: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_users(league_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/league/{league_id}/users"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch league users: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_matchups(league_id, week):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/league/{league_id}/matchups/{week}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch matchups: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_draft(draft_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/draft/{draft_id}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch draft data: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_draft_picks(draft_id):
-        url = f"{SleeperAPI.SLEEPER_BASE_URL}/draft/{draft_id}/picks"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch draft picks: {response.status_code}")
-            return None
-
-
-class ESPNAPI:
-    @staticmethod
-    def get_scores(sport, league):
-        if sport == "football" and league == "nfl":
-            url = "http://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-        elif sport == "basketball" and league == "nba":
-            url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-        else:
-            raise ValueError("Invalid sport or league provided.")
-
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json().get('events', [])
-        else:
-            print(f"Failed to fetch scores: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_teams(sport, league):
-        if sport == "football" and league == "nfl":
-            url = "http://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
-        elif sport == "basketball" and league == "nba":
-            url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams"
-        else:
-            raise ValueError("Invalid sport or league provided.")
-
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json().get('sports', [])[0]['leagues'][0]['teams']
-        else:
-            print(f"Failed to fetch teams: {response.status_code}")
-            return None
-
-    @staticmethod
-    def get_player_stats(sport, player_id):
-        if sport == "football":
-            url = f"http://site.api.espn.com/apis/site/v2/sports/football/nfl/players/{player_id}/statistics"
-        elif sport == "basketball":
-            url = f"http://site.api.espn.com/apis/site/v2/sports/basketball/nba/players/{player_id}/statistics"
-        else:
-            raise ValueError("Invalid sport provided.")
-
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Failed to fetch player stats: {response.status_code}")
-            return None
-
-
-'***********************************************************************'
-'''Load and Process Data'''
+# Data Loading and Processing Functions
 def load_json_data(file_path):
-    """Load JSON data from a file."""
     with open(file_path, 'r') as f:
         return json.load(f)
 
-
 def process_teams_data(teams_data):
-    """Process teams data from the JSON structure."""
     teams_list = []
-    for team_info in teams_data:
-        team = team_info['team']
+    for team_info in teams_data.get('sports', [])[0].get('leagues', [])[0].get('teams', []):
+        team = team_info.get('team', {})
         teams_list.append({
-            'id': team['id'],
-            'abbreviation': team['abbreviation'],
-            'displayName': team['displayName'],
-            'shortDisplayName': team['shortDisplayName'],
-            'location': team['location'],
+            'id': team.get('id'),
+            'abbreviation': team.get('abbreviation'),
+            'displayName': team.get('displayName'),
+            'shortDisplayName': team.get('shortDisplayName'),
+            'location': team.get('location'),
             'color': team.get('color'),
             'alternateColor': team.get('alternateColor'),
-            'logos': team['logos'][0]['href'] if team.get('logos') else None,
-            'clubhouseLink': team['links'][0]['href'] if team.get('links') else None
+            'logos': team.get('logos', [{}])[0].get('href'),
+            'clubhouseLink': next((link.get('href') for link in team.get('links', []) if 'clubhouse' in link.get('rel', [])), None)
         })
     return teams_list
 
 
 def process_scores_data(scores_data):
-    """Process scores data from the JSON structure."""
     scores_list = []
-    for event in scores_data:
-        competition = event.get('competitions', [])[0] if event.get('competitions') else None
-        if competition:
-            for competitor in competition.get('competitors', []):
-                scores_list.append({
-                    'game_id': event['id'],
-                    'date': event['date'],
-                    'team_id': competitor['team']['id'],
-                    'homeAway': competitor['homeAway'],
-                    'score': competitor.get('score'),
-                    # Adding placeholder values for target fields
-                    'fantasy_points': 0,
-                    'touchdowns': 0,
-                    'yards': 0,
-                    'receptions': 0,
-                    'fumbles': 0,
-                    'interceptions': 0,
-                    'field_goal': 0,
-                })
+    for event in scores_data.get('events', []):
+        competition = event.get('competitions', [])[0]
+        for competitor in competition.get('competitors', []):
+            scores_list.append({
+                'game_id': event.get('id'),
+                'date': event.get('date'),
+                'team_id': competitor['team']['id'],
+                'homeAway': competitor.get('homeAway'),
+                'score': competitor.get('score'),
+                # Add more fields as needed
+            })
     return scores_list
 
-
 def merge_data(teams_list, scores_list):
-    """Merge the processed teams and scores data."""
-    merged_data = []
-    for score in scores_list:
-        team = next((team for team in teams_list if team['id'] == score['team_id']), None)
-        if team:
-            merged_record = {**score, **team}
-            merged_data.append(merged_record)
-    
-    if merged_data:
-        print("Sample Merged Data:", merged_data[0])  # Print first record as a sample
-
+    valid_team_ids = {team['id'] for team in teams_list}
+    merged_data = [
+        {**score, **team}
+        for score in scores_list if score['team_id'] in valid_team_ids
+        for team in [next((team for team in teams_list if team['id'] == score['team_id']), None)] if team
+    ]
     if not merged_data:
         raise ValueError("No valid data to process after merging.")
     return merged_data
 
-
 def extract_features_and_targets(merged_data):
-    """Extract features and targets from the merged data."""
-    # Convert merged_data into a DataFrame for easier processing
     df = pd.DataFrame(merged_data)
-    
-    # Print the columns to check what is available
-    print("DataFrame Columns:", df.columns)
-    
-    # Define feature columns and target columns
+    df.dropna(inplace=True)
     feature_columns = ['team_id', 'abbreviation', 'location', 'homeAway', 'score', 'game_id', 'date']
-    
-    # Make sure these target columns exist in your DataFrame
     target_columns = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
-    
-    # Check if the target columns exist in df
     missing_targets = [col for col in target_columns if col not in df.columns]
+
     if missing_targets:
         raise KeyError(f"Missing target columns: {missing_targets}")
-    
-    # Extract features and targets
+
     X = df[feature_columns].copy()
     y = df[target_columns].copy()
-    
-    # Handle date feature: Convert to datetime and extract useful features
+
     X['date'] = pd.to_datetime(X['date'])
-    X['year'] = X['date'].dt.year
-    X['month'] = X['date'].dt.month
-    X['day'] = X['date'].dt.day
-    X['day_of_week'] = X['date'].dt.dayofweek
+    X['year'], X['month'], X['day'], X['day_of_week'] = X['date'].dt.year, X['date'].dt.month, X['date'].dt.day, X['date'].dt.dayofweek
     X.drop('date', axis=1, inplace=True)
-    
-    # Identify categorical and numerical columns
+
     categorical_features = ['team_id', 'abbreviation', 'location', 'homeAway', 'game_id']
     numerical_features = ['score', 'year', 'month', 'day', 'day_of_week']
-    
-    # Define the ColumnTransformer with appropriate encoders
+
     preprocessor = ColumnTransformer(
         transformers=[
             ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features),
             ('num', 'passthrough', numerical_features)
         ]
     )
-    
-    # Create a preprocessing pipeline
+
     pipeline = Pipeline(steps=[('preprocessor', preprocessor)])
-    
-    # Fit and transform the features
     X_processed = pipeline.fit_transform(X)
-    
-    # Convert targets to NumPy array
-    y_processed = y.values  # Shape: (n_samples, n_targets)
-    
+    y_processed = y.values
+
     return X_processed, y_processed
 
 
-def prepare_training_data(teams_file_path, scores_file_path):
-    # Load the data
-    teams_data = load_json_data(teams_file_path)
-    scores_data = load_json_data(scores_file_path)  
 
-    print(f"Teams Data: {len(teams_data)} records loaded")
-    print(f"Scores Data: {len(scores_data)} records loaded")
+def get_live_teams_and_scores_data():
+    try:
+        cached_data = load_cache()
+        if cached_data:
+            teams_data = cached_data['teams_data']
+            scores_data = cached_data['scores_data']
+        else:
+            teams_data = fetch_live_teams_data()
+            scores_data = fetch_live_scores_data()
+            save_cache({'teams_data': teams_data, 'scores_data': scores_data})
+        return teams_data, scores_data
+    except Exception as e:
+        logger.error(f"Error fetching live data: {e}")
+        raise
 
-    if not teams_data or not scores_data:
-        raise ValueError("No data loaded from JSON files")
 
-    # Process the data
+
+def prepare_training_data(week=None):
+    teams_data, scores_data = get_live_teams_and_scores_data()
     teams_list = process_teams_data(teams_data)
     scores_list = process_scores_data(scores_data)
 
-    print(f"Processed Teams: {len(teams_list)} records")
-    print(f"Processed Scores: {len(scores_list)} records")
+    if week is not None:
+        scores_list = [score for score in scores_list if score.get('week', {}).get('number') == week]
 
-    if not teams_list or not scores_list:
-        raise ValueError("No data available after processing")
+    if not scores_list:
+        scores_list = process_scores_data(scores_data)
 
-    # Merge the data
     merged_data = merge_data(teams_list, scores_list)
-    print(f"Merged Data: {len(merged_data)} records")
+    return extract_features_and_targets(merged_data)
 
-    # Extract features and targets
-    X, y = extract_features_and_targets(merged_data)
-    print(f"Extracted Features: {X.shape[0]} samples")
-    print(f"Extracted Targets: {y.shape[0]} samples")
+# Save the models
+def retrain_models():
+    X, y = prepare_training_data()
+    xgb_model = train_xgboost_model(X, y)
+    joblib.dump(xgb_model, 'backend/models/xgb_model_full.joblib')
+    try:
+        X, y = prepare_training_data()
+    except Exception as e:
+        logger.error(f"Error preparing training data: {e}")
 
-    if X.size == 0 or y.size == 0:
-        raise ValueError("No data available after extracting features and targets")
+# Prepare and Train Models
+X, y = prepare_training_data()
+xgb_model = train_xgboost_model(X, y)
+ensemble_accuracy = train_ensemble_model(X, y, xgb_model)
+print(f"Final Ensemble Model Accuracy: {ensemble_accuracy:.2f}")
 
-    return X, y
+# Model Saving and Loading
+XGB_MODEL_PATH = 'backend/models/xgb_model_{}.joblib'
 
-
-# Call the function to prepare the data
-X, y = prepare_training_data(teams_file_path, scores_file_path)
-# Train the model using the actual data
-model = xgboost_model(X, y, problem_type="regression")
-
-print(f"Features (X): {X.shape[0]} samples")
-print(f"Targets (y): {y.shape[0]} samples")
-print(f"y shape: {y.shape}")
-
-
-
-'***********************************************************************'
-'''Models'''
-# Define file paths for models
-XGB_MODEL_PATH = 'backend/models/xgb_model.json'
-TRANSFER_MODEL_PATH = 'backend/models/transfer_model.h5'
-
-# Load or train models
-if not os.path.exists(XGB_MODEL_PATH):
-    print("XGBoost model not found, training the model...")
-    X, y = prepare_training_data(teams_file_path, scores_file_path)
-    xgb_model = xgboost_model(X, y)
-    #xgb_model.save_model(XGB_MODEL_PATH)
+if not os.path.exists(XGB_MODEL_PATH.format(0)):
+    print("XGBoost models not found, training the models...")
+    xgb_model = train_xgboost_model(X, y)
+    for idx, estimator in enumerate(xgb_model.estimators_):
+        joblib.dump(estimator, XGB_MODEL_PATH.format(idx))
 else:
-    xgb_model = xgb.XGBRegressor()
-    xgb_model.load_model(XGB_MODEL_PATH)
+    from sklearn.multioutput import MultiOutputClassifier
+    from xgboost import XGBClassifier
+    estimators = [joblib.load(XGB_MODEL_PATH.format(idx)) for idx in range(y.shape[1])]
+    xgb_model = MultiOutputClassifier(XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3))
+    xgb_model.estimators_ = estimators
 
-if not os.path.exists(TRANSFER_MODEL_PATH):
-    print("Transfer learning model not found, training the model...")
-    X_train, y_train = prepare_training_data(teams_file_path, scores_file_path)
-    transfer_model = train_transfer_model(X_train, y_train)
-    transfer_model.save(TRANSFER_MODEL_PATH)
-else:
-    transfer_model = tf.keras.models.load_model(TRANSFER_MODEL_PATH)
+'*************************************************************'
+# Define scheduled jobs
+def schedule_jobs():
+    # Schedule college data updates every Friday at 5:00 AM
+    scheduler.add_job(
+        update_college_data,
+        trigger=CronTrigger(day_of_week='fri', hour=5, minute=0),
+        id='update_college_data',
+        replace_existing=True
+    )
 
-'***********************************************************************'
-'''Routes'''
-# Define routes
+    # Schedule NBA data updates twice weekly on Mondays and Thursdays at 6:00 AM
+    scheduler.add_job(
+        update_nba_data,
+        trigger=CronTrigger(day_of_week='mon,thu', hour=6, minute=0),
+        id='update_nba_data',
+        replace_existing=True
+    )
+
+    # Schedule NFL data updates every Saturday at 5:00 AM
+    scheduler.add_job(
+        update_nfl_data,
+        trigger=CronTrigger(day_of_week='sat', hour=5, minute=0),
+        id='update_nfl_data',
+        replace_existing=True
+    )
+
+    # Schedule retrain_models to run every Friday at 6:00 AM
+    scheduler.add_job(
+        retrain_models,
+        trigger=CronTrigger(day_of_week='fri', hour=6, minute=0),
+        id='retrain_models_friday',
+        replace_existing=True
+    )
+
+    # Start the scheduler
+    scheduler.start()
+
+    # Shut down the scheduler when exiting the app
+    atexit.register(lambda: scheduler.shutdown())
+
+# Ensure that the scheduler is initialized before scheduling jobs
+# Initialize the scheduler (if not already done)
+# scheduler = BackgroundScheduler()
+
+# Define your update functions before scheduling them
+def update_college_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_cfb_teams_data()
+        scores_data = fetch_live_cfb_scores_data()
+
+        # Process data
+        teams_list = process_cfb_teams_data(teams_data)
+        scores_list = process_cfb_scores_data(scores_data)
+
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
+
+        # Save data
+        save_data(merged_data, 'cfb_data.json')
+
+        logger.info("College Football data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating College Football data: {e}")
+
+
+def update_nba_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_nba_teams_data()
+        scores_data = fetch_live_nba_scores_data()
+
+        # Process data
+        teams_list = process_nba_teams_data(teams_data)
+        scores_list = process_nba_scores_data(scores_data)
+
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
+
+        # Save data
+        save_data(merged_data, 'nba_data.json')
+
+        logger.info("NBA data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating NBA data: {e}")
+
+
+def update_nfl_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_nfl_teams_data()
+        scores_data = fetch_live_nfl_scores_data()
+
+        # Process data
+        teams_list = process_nfl_teams_data(teams_data)
+        scores_list = process_nfl_scores_data(scores_data)
+
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
+
+        # Save data
+        save_data(merged_data, 'nfl_data.json')
+
+        logger.info("NFL data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating NFL data: {e}")
+
+
+def retrain_models():
+    try:
+        # Retrain models for each sport
+        retrain_model_for_sport('nfl')
+        retrain_model_for_sport('cfb')
+        retrain_model_for_sport('nba')
+
+        logger.info("Models retrained and saved successfully.")
+    except Exception as e:
+        logger.error(f"Error retraining models: {e}")
+
+
+# Call the schedule_jobs function when the app starts
+schedule_jobs()
+
+# Schedule college data updates every Friday at 5:00 AM
+scheduler.add_job(
+    update_college_data,
+    trigger=CronTrigger(day_of_week='fri', hour=5, minute=0),
+    id='update_college_data',
+    replace_existing=True
+)
+
+# Schedule NBA data updates twice weekly
+scheduler.add_job(
+    update_nba_data,
+    trigger=CronTrigger(day_of_week='mon,thu', hour=6, minute=0),
+    id='update_nba_data',
+    replace_existing=True
+)
+
+# Schedule NFL data updates every Saturday at 5:00 AM
+scheduler.add_job(
+    update_nfl_data,
+    trigger=CronTrigger(day_of_week='sat', hour=5, minute=0),
+    id='update_nfl_data',
+    replace_existing=True
+)
+
+'*************************************************************'
+# Define Routes
+@app.route('/')
+def home():
+    return "Welcome to the Fantasy Sports Optimizer!"
+
+@app.route('/favicon.ico')
+def favicon():
+    return "", 204
+
 @app.route('/api/predict', methods=['POST'])
 def predict():
     data = request.json
     df = pd.DataFrame([data])
     df, _, _ = preprocess_data(df)
-    
     xgb_proba = xgb_model.predict(df)
-    transfer_proba = transfer_model.predict(df.values)
-
-    ensemble_proba = (xgb_proba + transfer_proba) / 2
-
-    # Convert the predictions into a dictionary
     targets = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
-    predictions = dict(zip(targets, ensemble_proba[0]))
-    
-    return jsonify(predictions)
+    return jsonify(dict(zip(targets, xgb_proba[0])))
 
 @app.route('/api/predict_weekly', methods=['POST'])
 def predict_weekly():
-    data = request.json  # Data should include week, player info, etc.
+    data = request.json
     df = pd.DataFrame([data])
     df, _, _ = preprocess_data(df)
-    
-    target_columns = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
     predictions = xgb_model.predict(df)
-    
-    prediction_dict = {target: float(pred) for target, pred in zip(target_columns, predictions)}
-    
-    return jsonify(prediction_dict)
+    target_columns = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
+    return jsonify({target: float(pred) for target, pred in zip(target_columns, predictions[0])})
 
 
-# Function to prepare training data based on the current week
-def get_current_week(season_start_date):
-    season_start = datetime.strptime(season_start_date, '%Y-%m-%d')
-    current_date = datetime.now()
-    days_diff = (current_date - season_start).days
-    current_week = days_diff // 7 + 1
-    return current_week
-
-# Example start dates
-nfl_season_start_date = '2024-09-05'
-nba_season_start_date = '2024-10-24'
-
-# Determine current week
-current_week = get_current_week(nfl_season_start_date)  # Use NBA start date for NBA data
-
-X, y = prepare_training_data(week=current_week)
-
-
-'***********************************************************************'
-'''Sleeper API Endpoints'''
-@app.route('/api/sleeper/user_data', methods=['POST'])
-def get_sleeper_user_data():
-    data = request.json
-    username_or_id = data.get('username_or_id')
-    if not username_or_id:
-        return jsonify({"error": "Username or ID required"}), 400
+'*************************************************************'
+def integrate_data(sleeper_data, espn_data):
+    """
+    Integrate Sleeper and ESPN data into a single DataFrame and preprocess it.
+    """
+    sleeper_df = pd.DataFrame(sleeper_data)
+    espn_df = pd.DataFrame(espn_data)
     
-    user_data = SleeperAPI.get_user(username_or_id)
+    # Merge the data on the 'player_id' key
+    if 'player_id' not in sleeper_df.columns or 'player_id' not in espn_df.columns:
+        raise ValueError("Both datasets must contain the 'player_id' column for merging.")
     
-    if user_data:
-        df = pd.DataFrame([user_data])
-        df, label_encoders, scaler = preprocess_data(df)
-        json_response = df.to_dict(orient='records')
-        
-        return jsonify(json_response)
-        
-    return jsonify({"error": "User not found"}), 404
+    integrated_df = pd.merge(sleeper_df, espn_df, on='player_id', how='inner')
+    
+    # Add any additional preprocessing as needed
+    return integrated_df
 
 
-@app.route('/api/sleeper/player_stats/<player_id>', methods=['GET'])
-def get_sleeper_player_stats(player_id):
-    player_data = SleeperAPI.get_player_stats(player_id)
-    
-    if player_data:
-        df = pd.DataFrame([player_data])
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='player')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Player not found"}), 404
+def search_players():
+    player_name = request.args.get('player_name', default=None)
+    team_abbr = request.args.get('team_abbr', default=None)
+    stat_filter = request.args.get('stat_filter', default=None)
+    output_format = request.args.get('format', default='json')
+    sort_by = request.args.get('sort_by', default=None)
 
-@app.route('/api/sleeper/leagues/<user_id>/<sport>/<season>', methods=['GET'])
-def get_sleeper_leagues(user_id, sport, season):
-    leagues = SleeperAPI.get_leagues(user_id, sport, season)
-    
-    if leagues:
-        df = pd.DataFrame(leagues)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Leagues not found"}), 404
+    # Fetch player data from Sleeper API
+    sleeper_players = player_endpoint.get_all_players(sport='nfl', clean=True)
+    #sleeper_players_df = pd.DataFrame(players)
 
-@app.route('/api/sleeper/league/<league_id>', methods=['GET'])
-def get_sleeper_league(league_id):
-    league_data = SleeperAPI.get_league(league_id)
-    
-    if league_data:
-        df = pd.DataFrame([league_data])
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "League not found"}), 404
+    # Fetch player data from ESPN API
+    espn_players = ESPNAPI.get_players('football', 'nfl')
+    #espn_players_df = pd.DataFrame(espn_players)
 
-@app.route('/api/sleeper/user/<username_or_id>', methods=['GET'])
-def get_sleeper_user(username_or_id):
-    user_data = SleeperAPI.get_user(username_or_id)
-    
-    if user_data:
-        df = pd.DataFrame([user_data])
-        df, label_encoders, scaler = preprocess_data(df)
-        json_response = df.to_dict(orient='records')
-        
-        return jsonify(json_response)
-        
-    return jsonify({"error": "User not found"}), 404
+ # Integrate the data
+    integrated_df = integrate_data(sleeper_players, espn_players)
 
-@app.route('/api/sleeper/league/<league_id>/rosters', methods=['GET'])
-def get_sleeper_league_rosters(league_id):
-    rosters = SleeperAPI.get_rosters(league_id)
-    
-    if rosters:
-        df = pd.DataFrame(rosters)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Rosters not found"}), 404
+    # Apply filters based on query parameters
+    if player_name:
+        integrated_df = integrated_df[integrated_df['displayName'].str.contains(player_name, case=False)]
 
-@app.route('/api/sleeper/league/<league_id>/users', methods=['GET'])
-def get_sleeper_league_users(league_id):
-    users = SleeperAPI.get_users(league_id)
-    
-    if users:
-        df = pd.DataFrame(users)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='player')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Users not found"}), 404
+    if team_abbr:
+        integrated_df = integrated_df[integrated_df['teamAbbr'] == team_abbr.upper()]
 
-@app.route('/api/sleeper/league/<league_id>/matchups/<week>', methods=['GET'])
-def get_sleeper_league_matchups(league_id, week):
-    matchups = SleeperAPI.get_matchups(league_id, week)
-    
-    if matchups:
-        df = pd.DataFrame(matchups)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Matchups not found"}), 404
+    if stat_filter:
+        integrated_df = integrated_df[integrated_df[stat_filter] > 0]
 
-@app.route('/api/sleeper/draft/<draft_id>', methods=['GET'])
-def get_sleeper_draft(draft_id):
-    draft_data = SleeperAPI.get_draft(draft_id)
-    
-    if draft_data:
-        df = pd.DataFrame([draft_data])
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Draft not found"}), 404
+    if sort_by:
+        integrated_df = integrated_df.sort_values(by=sort_by, ascending=False)
 
-@app.route('/api/sleeper/draft/<draft_id>/picks', methods=['GET'])
-def get_sleeper_draft_picks(draft_id):
-    picks = SleeperAPI.get_draft_picks(draft_id)
-    
-    if picks:
-        df = pd.DataFrame(picks)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='team')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Picks not found"}), 404
-
-@app.route('/api/sleeper/players/<sport>', methods=['GET'])
-def get_sleeper_players(sport):
-    players = SleeperAPI.get_players(sport)
-    
-    if players:
-        df = pd.DataFrame(players)
-        df, label_encoders, scaler = preprocess_data(df)
-        df = apply_feature_engineering(df, feature_type='player')
-        return jsonify(df.to_dict(orient='records'))
-    
-    return jsonify({"error": "Players not found"}), 404
+    # Return data as JSON or CSV
+    if output_format == 'csv':
+        return integrated_df.to_csv(index=False), 200, {'Content-Type': 'text/csv'}
+    else:
+        return jsonify(integrated_df.to_dict(orient='records'))
 
 
-'***********************************************************************'
-'''ESPN API Endpoints'''
+'*************************************************************'
+class ESPNEndpoint:
+    BASE_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+
+    def __init__(self):
+        pass
+
+    def get_all_players(self, sport='nfl'):
+        """
+        Fetch all players from ESPN API.
+        """
+        url = f"{self.BASE_URL}/players"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch data from ESPN API: {response.status_code}")
+        players = response.json()
+        return players
+    
+
+    
+
+    # Add other ESPN-specific endpoints as needed
+
+
+'*************************************************************'
+# ESPN API Endpoints
 @app.route('/api/espn/college_football/news', methods=['GET'])
 def get_college_football_news():
     url = 'http://site.api.espn.com/apis/site/v2/sports/football/college-football/news'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        news = response.json()
-        return jsonify(news)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "College Football news not found"}), 404
 
 @app.route('/api/espn/college_football/scoreboard', methods=['GET'])
 def get_college_football_scores():
     url = 'http://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard'
-    params = {
-        'calendar': request.args.get('calendar', 'blacklist'),
-        'dates': request.args.get('dates')
-    }
+    params = {'calendar': request.args.get('calendar', 'blacklist'), 'dates': request.args.get('dates')}
     response = requests.get(url, params=params)
-    
     if response.status_code == 200:
-        scores = response.json()
-        return jsonify(scores)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "College Football scores not found"}), 404
 
 @app.route('/api/espn/college_football/game/<gameId>', methods=['GET'])
 def get_college_football_game_info(gameId):
     url = f'http://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event={gameId}'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        game_info = response.json()
-        return jsonify(game_info)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": f"Game {gameId} not found"}), 404
 
 @app.route('/api/espn/college_football/teams/<team>', methods=['GET'])
 def get_college_football_team_info(team):
     url = f'http://site.api.espn.com/apis/site/v2/sports/football/college-football/teams/{team}'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        team_info = response.json()
-        return jsonify(team_info)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": f"Team {team} not found"}), 404
 
 @app.route('/api/espn/college_football/rankings', methods=['GET'])
 def get_college_football_rankings():
     url = 'http://site.api.espn.com/apis/site/v2/sports/football/college-football/rankings'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        rankings = response.json()
-        return jsonify(rankings)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "Rankings not found"}), 404
 
-# NFL Endpoints
 @app.route('/api/espn/nfl/scoreboard', methods=['GET'])
 def get_nfl_scores():
-    url = 'http://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard'
-    response = requests.get(url)
-    
-    if response.status_code == 200:
-        scores = response.json()
-        return jsonify(scores)
+    nfl_scores = ESPNAPI.get_scores("football", "nfl")
+    if nfl_scores:
+        pretty_json = json.dumps(nfl_scores, indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NFL scores not found"}), 404
 
 @app.route('/api/espn/nfl/news', methods=['GET'])
 def get_nfl_news():
     url = 'http://site.api.espn.com/apis/site/v2/sports/football/nfl/news'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        news = response.json()
-        return jsonify(news)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NFL news not found"}), 404
 
 @app.route('/api/espn/nfl/teams', methods=['GET'])
 def get_nfl_teams():
     url = 'http://site.api.espn.com/apis/site/v2/sports/football/nfl/teams'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        teams = response.json()
-        return jsonify(teams)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NFL teams not found"}), 404
 
 @app.route('/api/espn/nfl/teams/<team>', methods=['GET'])
 def get_nfl_team_info(team):
     url = f'http://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team}'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        team_info = response.json()
-        return jsonify(team_info)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": f"Team {team} not found"}), 404
 
-# NBA Endpoints
 @app.route('/api/espn/nba/scoreboard', methods=['GET'])
 def get_nba_scores():
     url = 'http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        scores = response.json()
-        return jsonify(scores)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NBA scores not found"}), 404
 
 @app.route('/api/espn/nba/news', methods=['GET'])
 def get_nba_news():
     url = 'http://site.api.espn.com/apis/site/v2/sports/basketball/nba/news'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        news = response.json()
-        return jsonify(news)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NBA news not found"}), 404
 
 @app.route('/api/espn/nba/teams', methods=['GET'])
 def get_nba_teams():
     url = 'http://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        teams = response.json()
-        return jsonify(teams)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": "NBA teams not found"}), 404
 
 @app.route('/api/espn/nba/teams/<team>', methods=['GET'])
 def get_nba_team_info(team):
     url = f'http://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team}'
     response = requests.get(url)
-    
     if response.status_code == 200:
-        team_info = response.json()
-        return jsonify(team_info)
+        pretty_json = json.dumps(response.json(), indent=4)
+        return Response(pretty_json, mimetype='application/json')
     return jsonify({"error": f"NBA team {team} not found"}), 404
 
-
-# College Football Endpoints
-
 if __name__ == '__main__':
+    schedule_jobs()
     app.run(debug=True, host='0.0.0.0')
