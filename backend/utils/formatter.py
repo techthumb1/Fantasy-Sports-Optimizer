@@ -1,7 +1,16 @@
 import json
 
 def pretty_print_json(json_data):
-    print(json.dumps(json_data, indent=4, sort_keys=True))
+    """
+    Converts JSON data into a pretty-printed JSON string.
+
+    Args:
+        json_data (dict): The JSON data to be formatted.
+
+    Returns:
+        str: A pretty-printed JSON string.
+    """
+    return json.dumps(json_data, indent=4, sort_keys=True)
 
 # Example usage
 if __name__ == "__main__":
@@ -10,4 +19,4 @@ if __name__ == "__main__":
         "version": "1.0",
         "description": "Optimize your fantasy sports teams with AI."
     }
-    pretty_print_json(sample_json)
+    print(pretty_print_json(sample_json))
