@@ -4,83 +4,135 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression
 from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.layers import Dense, Flatten
-from tensorflow.keras.models import Model
-from utils.preprocessing import preprocess_data
+from tensorflow.keras.layers import Dense, Flatten, Dropout
+from tensorflow.keras.models import Model, Sequential
+import joblib  # Directly import joblib
+from ..utils.preprocessing import preprocess_data
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.preprocessing import LabelBinarizer
+from xgboost import XGBClassifier 
 
+# Define file paths
+XGB_MODEL_PATH = 'backend/models/xgb_model_{}.joblib'
+TRANSFER_MODEL_PATH = 'backend/models/transfer_model.h5'
+
+# Train the XGBoost model
 def train_xgboost_model(X, y):
-    """Train an XGBoost model and return the trained model and accuracy."""
+    """Train and return a MultiOutput XGBoost model for multi-output classification."""
+    
+    # Train-test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # Train XGBoost Model
-    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3)
-    xgb_model.fit(X_train, y_train)
+    # Initialize the XGBoost model with MultiOutputClassifier
+    xgb_base_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3)
+    multi_output_model = MultiOutputClassifier(xgb_base_model, n_jobs=-1)
+    multi_output_model.fit(X_train, y_train)
 
-    # Generate predictions and calculate accuracy
-    xgb_preds = xgb_model.predict(X_test)
-    xgb_accuracy = accuracy_score(y_test, xgb_preds)
-    print(f"XGBoost Model Accuracy: {xgb_accuracy:.2f}")
+    # Predict
+    y_pred = multi_output_model.predict(X_test)
 
-    return xgb_model, xgb_accuracy
+    # Evaluate: Accuracy can be calculated for each output separately
+    for i in range(y.shape[1]):
+        accuracy = accuracy_score(y_test[:, i], y_pred[:, i])
+        print(f"Output {i} Accuracy: {accuracy:.2f}")
 
-def train_transfer_model(X, y):
-    """Train a transfer learning model using ResNet50 and return the trained model and accuracy."""
-    base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    return multi_output_model
 
-    # Freeze the base model
-    for layer in base_model.layers:
-        layer.trainable = False
+# Train a dense neural network model for tabular data
+def train_dense_nn_model(X, y):
+    """Train and return a dense neural network model for multi-output classification."""
+    
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # Add custom layers on top of the base model
-    x = Flatten()(base_model.output)
-    x = Dense(512, activation='relu')(x)
-    predictions = Dense(len(np.unique(y)), activation='softmax')(x)
+    # Define a simple feedforward neural network
+    model = Sequential()
+    model.add(Dense(128, activation='relu', input_shape=(X_train.shape[1],)))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(y_train.shape[1], activation='softmax'))  # Adjust output layer for multi-output classification
 
-    # Define the model
-    transfer_model = Model(inputs=base_model.input, outputs=predictions)
-    transfer_model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-
-    # Assuming X contains preprocessed images
-    X_train_images, X_test_images, y_train_images, y_test_images = train_test_split(X, y, test_size=0.2, random_state=42)
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
     # Train the model
-    transfer_model.fit(X_train_images, y_train_images, epochs=10, batch_size=32, validation_data=(X_test_images, y_test_images))
+    model.fit(X_train, y_train, epochs=10, batch_size=32, validation_data=(X_test, y_test))
 
     # Evaluate the model
-    transfer_accuracy = transfer_model.evaluate(X_test_images, y_test_images, verbose=0)
-    print(f"Transfer Learning Model Accuracy: {transfer_accuracy[1]:.2f}")
+    transfer_accuracy = model.evaluate(X_test, y_test, verbose=0)
+    print(f"Dense Neural Network Model Accuracy: {transfer_accuracy[1]:.2f}")
 
-    return transfer_model, transfer_accuracy
+    return model
 
-def train_ensemble_model(X, y):
-    """Train an ensemble model using XGBoost and transfer learning, and return ensemble accuracy."""
-    # Train XGBoost and transfer learning models
-    xgb_model, xgb_accuracy = train_xgboost_model(X, y)
-    transfer_model, transfer_accuracy = train_transfer_model(X, y)
+# Save and load models
+def save_models(xgb_model, nn_model):
+    """Save the XGBoost and Dense Neural Network models."""
+    # Save each individual XGBoost model
+    for idx, estimator in enumerate(xgb_model.estimators_):
+        joblib.dump(estimator, XGB_MODEL_PATH.format(idx))
+        print(f"XGBoost model for target {idx} saved as {XGB_MODEL_PATH.format(idx)}")
+    
+    # Save the dense neural network model
+    nn_model.save(TRANSFER_MODEL_PATH)
+    print(f"Dense Neural Network model saved as {TRANSFER_MODEL_PATH}")
 
-    # Generate predictions
-    X_train_images, X_test_images, y_train_images, y_test_images = train_test_split(X, y, test_size=0.2, random_state=42)
-    xgb_proba = xgb_model.predict_proba(X_test_images)
-    transfer_proba = transfer_model.predict(X_test_images)
+def load_models(num_targets):
+    """Load the XGBoost and Dense Neural Network models."""
+    # Load XGBoost models
+    estimators = []
+    for idx in range(num_targets):
+        estimator = joblib.load(XGB_MODEL_PATH.format(idx))
+        estimators.append(estimator)
+    
+    xgb_model = MultiOutputClassifier(XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3))
+    xgb_model.estimators_ = estimators
+    
+    # Load dense neural network model
+    nn_model = tf.keras.models.load_model(TRANSFER_MODEL_PATH)
+    
+    return xgb_model, nn_model
 
-    # Average the probabilities
-    ensemble_proba = (xgb_proba + transfer_proba) / 2
-    ensemble_preds = np.argmax(ensemble_proba, axis=1)
+# Train the ensemble model
+def train_ensemble_model(X, y, xgb_model):
+    """Train and return an ensemble model combining XGBoost predictions."""
+    
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    ensemble_accuracy = accuracy_score(y_test_images, ensemble_preds)
+    # Get predictions from XGBoost model
+    xgb_proba = np.array(xgb_model.predict_proba(X_test))  # This will be a list of arrays for each output
+
+    # Reshape xgb_proba to be consistent with y_test
+    if len(xgb_proba.shape) == 3:
+        xgb_proba = np.mean(xgb_proba, axis=2)  # Average across the classes if multilabel
+
+    # Get final predictions
+    if len(xgb_proba.shape) == 2:  # Multilabel indicator
+        ensemble_preds = (xgb_proba > 0.5).astype(int)
+    else:
+        ensemble_preds = np.argmax(xgb_proba, axis=-1)
+
+    # Ensure y_test is in the correct shape
+    if len(y_test.shape) == 1:
+        y_test = np.expand_dims(y_test, axis=-1)
+
+    # Evaluate ensemble predictions
+    ensemble_accuracy = accuracy_score(y_test, ensemble_preds)
     print(f"Ensemble Model Accuracy: {ensemble_accuracy:.2f}")
-
-    # Save the models
-    transfer_model.save('backend/models/transfer_model.h5')
-    xgb_model.save_model('backend/models/xgb_model.json')
 
     return ensemble_accuracy
 
-# If you want to train all models when running the script directly
+
+# Main execution to train models
 if __name__ == "__main__":
     X, y = preprocess_data()  # Ensure preprocess_data is correctly implemented
 
+    # Train individual models
+    xgb_model = train_xgboost_model(X, y)
+    nn_model = train_dense_nn_model(X, y)
+
     # Train ensemble model
-    ensemble_accuracy = train_ensemble_model(X, y)
+    ensemble_accuracy = train_ensemble_model(X, y, xgb_model, nn_model)
     print(f"Final Ensemble Model Accuracy: {ensemble_accuracy:.2f}")
