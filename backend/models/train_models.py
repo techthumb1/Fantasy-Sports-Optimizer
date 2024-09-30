@@ -14,6 +14,73 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.preprocessing import LabelBinarizer
 from xgboost import XGBClassifier 
 
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+import logging
+
+# Set up logging if not already configured
+logger = logging.getLogger(__name__)
+
+def extract_features_and_targets(merged_data):
+    """
+    Extracts features and targets from the merged data.
+
+    Parameters:
+    - merged_data (list of dict): The merged data containing both team and score information.
+
+    Returns:
+    - X_processed (numpy array): Processed feature matrix ready for model training.
+    - y_processed (numpy array): Processed target matrix.
+    """
+    df = pd.DataFrame(merged_data)
+    df.dropna(inplace=True)
+
+    # Define the feature and target columns
+    feature_columns = ['team_id', 'abbreviation', 'location', 'homeAway', 'score', 'game_id', 'date']
+    target_columns = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
+
+    # Check which target columns are available
+    available_target_columns = [col for col in target_columns if col in df.columns]
+    missing_targets = [col for col in target_columns if col not in df.columns]
+
+    if missing_targets:
+        logger.warning(f"Missing target columns: {missing_targets}")
+        if not available_target_columns:
+            raise KeyError("No target columns are available in the data.")
+
+    # Extract features and targets
+    X = df[feature_columns].copy()
+    y = df[available_target_columns].copy()
+
+    # Process date column into datetime and extract components
+    X['date'] = pd.to_datetime(X['date'])
+    X['year'] = X['date'].dt.year
+    X['month'] = X['date'].dt.month
+    X['day'] = X['date'].dt.day
+    X['day_of_week'] = X['date'].dt.dayofweek
+    X.drop('date', axis=1, inplace=True)
+
+    # Define categorical and numerical features
+    categorical_features = ['team_id', 'abbreviation', 'location', 'homeAway', 'game_id']
+    numerical_features = ['score', 'year', 'month', 'day', 'day_of_week']
+
+    # Preprocessing pipeline
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('cat', OneHotEncoder(handle_unknown='ignore', sparse=False), categorical_features),
+            ('num', 'passthrough', numerical_features)
+        ]
+    )
+
+    pipeline = Pipeline(steps=[('preprocessor', preprocessor)])
+    X_processed = pipeline.fit_transform(X)
+    y_processed = y.values
+
+    return X_processed, y_processed
+
+
 # Define file paths
 XGB_MODEL_PATH = 'backend/models/xgb_model_{}.joblib'
 TRANSFER_MODEL_PATH = 'backend/models/transfer_model.h5'

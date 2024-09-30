@@ -1,37 +1,51 @@
+# Imports
 import os
 import requests
-import pandas as pd
 import json
-import joblib
 import logging
+import pandas as pd
+import joblib
+from flask import Flask
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, Response
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from backend.api.sleeper import SleeperAPI
 from backend.api.espn import ESPNAPI
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import atexit
+from backend.models import xgboost_model as xgb_model
 from backend.utils.preprocessing import preprocess_data
-from backend.models.train_models import train_ensemble_model, train_xgboost_model
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from backend.api.player_endpoints import PlayerEndpoint
-from backend.utils.data_fetching import fetch_live_teams_data, fetch_live_scores_data
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-import atexit
 from backend.routes import sleeper_routes
-from backend.utils.data_updates import update_nfl_data, update_nba_data, update_college_data
-from backend.utils.cache import load_cache, save_cache
-from backend.utils.data_fetching import fetch_live_nfl_teams_data, fetch_live_nfl_scores_data, fetch_live_nba_teams_data, fetch_live_nba_scores_data, fetch_live_cfb_teams_data, fetch_live_cfb_scores_data
-from backend.utils.data_preprocessing import process_nfl_teams_data, process_nfl_scores_data, process_cfb_teams_data, process_cfb_scores_data, process_nba_teams_data, process_nba_scores_data
+from backend.utils.data_fetching import (
+    fetch_live_teams_data, fetch_live_scores_data,
+    fetch_live_nfl_teams_data, fetch_live_nfl_scores_data,
+    fetch_live_nba_teams_data, fetch_live_nba_scores_data,
+    fetch_live_cfb_teams_data, fetch_live_cfb_scores_data
+)
+from backend.utils.data_preprocessing import (
+    process_teams_data, process_scores_data, merge_data,
+    process_nfl_teams_data, process_nfl_scores_data,
+    process_nba_teams_data, process_nba_scores_data,
+    process_cfb_teams_data, process_cfb_scores_data
+)
+from backend.models.train_models import (
+    train_xgboost_model, train_ensemble_model, train_dense_nn_model, extract_features_and_targets
+)
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-
-# Initialize the Flask app
+# Initialize Flask app
 app = Flask(__name__)
 
-# Configuration for SQLite
+# Global variables and configurations
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///sports_optimizer.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -39,10 +53,6 @@ db = SQLAlchemy(app)
 
 # Register Blueprints
 app.register_blueprint(sleeper_routes)
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Define User model
 class User(db.Model):
@@ -70,24 +80,28 @@ load_dotenv()
 # Initialize the scheduler
 scheduler = BackgroundScheduler()
 
-# Define absolute paths for data
-#teams_file_path = os.path.join(os.path.dirname(__file__), 'teams_data.json')
-#scores_file_path = os.path.join(os.path.dirname(__file__), 'scores_data.json')
+# Define save_data function
+def save_data(data, file_path):
+    with open(file_path, 'w') as f:
+        json.dump(data, f)
 
-def get_live_teams_and_scores_data():
-    teams_data = fetch_live_teams_data()
-    scores_data = fetch_live_scores_data()
-    return teams_data, scores_data
+# Define load_cache function
+def load_cache():
+    if os.path.exists('cache.json'):
+        with open('cache.json', 'r') as f:
+            return json.load(f)
+    return None
+
+# Define save_cache function
+def save_cache(data):
+    with open('cache.json', 'w') as f:
+        json.dump(data, f)
 
 # Initialize Sleeper API client
 sleeper_client = SleeperAPI()
 player_endpoint = PlayerEndpoint(client=sleeper_client)
 espn_client = ESPNAPI()
 
-# Data Loading and Processing Functions
-def load_json_data(file_path):
-    with open(file_path, 'r') as f:
-        return json.load(f)
 
 def process_teams_data(teams_data):
     teams_list = []
@@ -105,7 +119,6 @@ def process_teams_data(teams_data):
             'clubhouseLink': next((link.get('href') for link in team.get('links', []) if 'clubhouse' in link.get('rel', [])), None)
         })
     return teams_list
-
 
 def process_scores_data(scores_data):
     scores_list = []
@@ -138,13 +151,16 @@ def extract_features_and_targets(merged_data):
     df.dropna(inplace=True)
     feature_columns = ['team_id', 'abbreviation', 'location', 'homeAway', 'score', 'game_id', 'date']
     target_columns = ['fantasy_points', 'touchdowns', 'yards', 'receptions', 'fumbles', 'interceptions', 'field_goal']
+    available_target_columns = [col for col in target_columns if col in df.columns]
     missing_targets = [col for col in target_columns if col not in df.columns]
 
     if missing_targets:
-        raise KeyError(f"Missing target columns: {missing_targets}")
+        logger.warning(f"Missing target columns: {missing_targets}")
+        if not available_target_columns:
+            raise KeyError("No target columns are available in the data.")
 
     X = df[feature_columns].copy()
-    y = df[target_columns].copy()
+    y = df[available_target_columns].copy()
 
     X['date'] = pd.to_datetime(X['date'])
     X['year'], X['month'], X['day'], X['day_of_week'] = X['date'].dt.year, X['date'].dt.month, X['date'].dt.day, X['date'].dt.dayofweek
@@ -166,8 +182,6 @@ def extract_features_and_targets(merged_data):
 
     return X_processed, y_processed
 
-
-
 def get_live_teams_and_scores_data():
     try:
         cached_data = load_cache()
@@ -183,8 +197,6 @@ def get_live_teams_and_scores_data():
         logger.error(f"Error fetching live data: {e}")
         raise
 
-
-
 def prepare_training_data(week=None):
     teams_data, scores_data = get_live_teams_and_scores_data()
     teams_list = process_teams_data(teams_data)
@@ -199,7 +211,21 @@ def prepare_training_data(week=None):
     merged_data = merge_data(teams_list, scores_list)
     return extract_features_and_targets(merged_data)
 
-# Save the models
+# Model Training Functions
+def train_xgboost_model(X, y):
+    xgb_model = xgb_model.fit(X, y)
+    return xgb_model
+
+def train_dense_nn_model(X, y):
+    dense_nn_model = train_dense_nn_model(X, y)
+    return dense_nn_model
+
+def train_ensemble_model(X, y, xgb_model):
+    # Train ensemble model
+    ensemble_model = train_ensemble_model(X, y, xgb_model)
+    return ensemble_model
+
+# Model Retraining Function
 def retrain_models():
     X, y = prepare_training_data()
     xgb_model = train_xgboost_model(X, y)
@@ -209,29 +235,70 @@ def retrain_models():
     except Exception as e:
         logger.error(f"Error preparing training data: {e}")
 
-# Prepare and Train Models
-X, y = prepare_training_data()
-xgb_model = train_xgboost_model(X, y)
-ensemble_accuracy = train_ensemble_model(X, y, xgb_model)
-print(f"Final Ensemble Model Accuracy: {ensemble_accuracy:.2f}")
+# Update Functions
+def update_college_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_cfb_teams_data()
+        scores_data = fetch_live_cfb_scores_data()
 
-# Model Saving and Loading
-XGB_MODEL_PATH = 'backend/models/xgb_model_{}.joblib'
+        # Process data
+        teams_list = process_cfb_teams_data(teams_data)
+        scores_list = process_cfb_scores_data(scores_data)
 
-if not os.path.exists(XGB_MODEL_PATH.format(0)):
-    print("XGBoost models not found, training the models...")
-    xgb_model = train_xgboost_model(X, y)
-    for idx, estimator in enumerate(xgb_model.estimators_):
-        joblib.dump(estimator, XGB_MODEL_PATH.format(idx))
-else:
-    from sklearn.multioutput import MultiOutputClassifier
-    from xgboost import XGBClassifier
-    estimators = [joblib.load(XGB_MODEL_PATH.format(idx)) for idx in range(y.shape[1])]
-    xgb_model = MultiOutputClassifier(XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3))
-    xgb_model.estimators_ = estimators
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
 
-'*************************************************************'
-# Define scheduled jobs
+        # Save data
+        save_data(merged_data, 'cfb_data.json')
+
+        logger.info("College Football data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating College Football data: {e}")
+
+def update_nba_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_nba_teams_data()
+        scores_data = fetch_live_nba_scores_data()
+
+        # Process data
+        teams_list = process_nba_teams_data(teams_data)
+        scores_list = process_nba_scores_data(scores_data)
+
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
+
+        # Save data
+        save_data(merged_data, 'nba_data.json')
+
+        logger.info("NBA data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating NBA data: {e}")
+
+def update_nfl_data():
+    try:
+        # Fetch live data
+        teams_data = fetch_live_nfl_teams_data()
+        scores_data = fetch_live_nfl_scores_data()
+
+        # Process data
+        teams_list = process_nfl_teams_data(teams_data)
+        scores_list = process_nfl_scores_data(scores_data)
+
+        # Merge data
+        merged_data = merge_data(teams_list, scores_list)
+
+        # Save data
+        save_data(merged_data, 'nfl_data.json')
+
+        logger.info("NFL data updated successfully.")
+    except Exception as e:
+        logger.error(f"Error updating NFL data: {e}")
+
+# Scheduler Setup
+scheduler = BackgroundScheduler()
+
 def schedule_jobs():
     # Schedule college data updates every Friday at 5:00 AM
     scheduler.add_job(
@@ -271,114 +338,6 @@ def schedule_jobs():
     # Shut down the scheduler when exiting the app
     atexit.register(lambda: scheduler.shutdown())
 
-# Ensure that the scheduler is initialized before scheduling jobs
-# Initialize the scheduler (if not already done)
-# scheduler = BackgroundScheduler()
-
-# Define your update functions before scheduling them
-def update_college_data():
-    try:
-        # Fetch live data
-        teams_data = fetch_live_cfb_teams_data()
-        scores_data = fetch_live_cfb_scores_data()
-
-        # Process data
-        teams_list = process_cfb_teams_data(teams_data)
-        scores_list = process_cfb_scores_data(scores_data)
-
-        # Merge data
-        merged_data = merge_data(teams_list, scores_list)
-
-        # Save data
-        save_data(merged_data, 'cfb_data.json')
-
-        logger.info("College Football data updated successfully.")
-    except Exception as e:
-        logger.error(f"Error updating College Football data: {e}")
-
-
-def update_nba_data():
-    try:
-        # Fetch live data
-        teams_data = fetch_live_nba_teams_data()
-        scores_data = fetch_live_nba_scores_data()
-
-        # Process data
-        teams_list = process_nba_teams_data(teams_data)
-        scores_list = process_nba_scores_data(scores_data)
-
-        # Merge data
-        merged_data = merge_data(teams_list, scores_list)
-
-        # Save data
-        save_data(merged_data, 'nba_data.json')
-
-        logger.info("NBA data updated successfully.")
-    except Exception as e:
-        logger.error(f"Error updating NBA data: {e}")
-
-
-def update_nfl_data():
-    try:
-        # Fetch live data
-        teams_data = fetch_live_nfl_teams_data()
-        scores_data = fetch_live_nfl_scores_data()
-
-        # Process data
-        teams_list = process_nfl_teams_data(teams_data)
-        scores_list = process_nfl_scores_data(scores_data)
-
-        # Merge data
-        merged_data = merge_data(teams_list, scores_list)
-
-        # Save data
-        save_data(merged_data, 'nfl_data.json')
-
-        logger.info("NFL data updated successfully.")
-    except Exception as e:
-        logger.error(f"Error updating NFL data: {e}")
-
-
-def retrain_models():
-    try:
-        # Retrain models for each sport
-        retrain_model_for_sport('nfl')
-        retrain_model_for_sport('cfb')
-        retrain_model_for_sport('nba')
-
-        logger.info("Models retrained and saved successfully.")
-    except Exception as e:
-        logger.error(f"Error retraining models: {e}")
-
-
-# Call the schedule_jobs function when the app starts
-schedule_jobs()
-
-# Schedule college data updates every Friday at 5:00 AM
-scheduler.add_job(
-    update_college_data,
-    trigger=CronTrigger(day_of_week='fri', hour=5, minute=0),
-    id='update_college_data',
-    replace_existing=True
-)
-
-# Schedule NBA data updates twice weekly
-scheduler.add_job(
-    update_nba_data,
-    trigger=CronTrigger(day_of_week='mon,thu', hour=6, minute=0),
-    id='update_nba_data',
-    replace_existing=True
-)
-
-# Schedule NFL data updates every Saturday at 5:00 AM
-scheduler.add_job(
-    update_nfl_data,
-    trigger=CronTrigger(day_of_week='sat', hour=5, minute=0),
-    id='update_nfl_data',
-    replace_existing=True
-)
-
-'*************************************************************'
 # Define Routes
 @app.route('/')
 def home():
@@ -485,8 +444,6 @@ class ESPNEndpoint:
     
 
     # Add other ESPN-specific endpoints as needed
-
-
 '*************************************************************'
 # ESPN API Endpoints
 @app.route('/api/espn/college_football/news', methods=['GET'])
