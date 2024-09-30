@@ -1,3 +1,5 @@
+from .data_fetching import fetch_live_nfl_teams_data, fetch_live_nfl_scores_data, fetch_live_nba_teams_data, fetch_live_nba_scores_data, fetch_live_college_teams_data, fetch_live_college_scores_data
+
 def update_nfl_data():
     # Fetch and process NFL data
     teams_data = fetch_live_nfl_teams_data()
