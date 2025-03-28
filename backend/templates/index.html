@@ -1,0 +1,28 @@
+<!-- templates/index.html -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Fantasy Sports Optimizer</title>
+</head>
+<body>
+    <h1>Fantasy Sports Optimizer</h1>
+    <form action="/predict" method="post">
+        <!-- Existing input fields -->
+
+        <!-- New input fields for the parameters -->
+        <label>Rushing Attempts:</label>
+        <input type="number" name="RushingAttempts"><br>
+
+        <label>Rushing Yards:</label>
+        <input type="number" name="RushingYards"><br>
+
+        <label>Rushing Touchdowns:</label>
+        <input type="number" name="RushingTouchdowns"><br>
+
+        <!-- Repeat for other parameters -->
+
+        <input type="submit" value="Predict">
+    </form>
+</body>
+</html>

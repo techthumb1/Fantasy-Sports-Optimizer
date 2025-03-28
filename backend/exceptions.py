@@ -1,5 +1,3 @@
-# backend/exceptions.py
-
 class SleeperAPIError(Exception):
     """Custom exception for Sleeper API related errors."""
     def __init__(self, message):

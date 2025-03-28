@@ -1,5 +1,4 @@
 from backend.api.sleeper import SleeperAPI
-from backend.api.espn import ESPNAPI
 from backend.utils.formatter import pretty_print_json
 
 class PlayerService:
@@ -14,3 +13,12 @@ class PlayerService:
     def search_players():
         # Add the search logic
         pass
+
+# backend/services/player_service.py
+def get_player_data(player_id):
+    from database_models import Player  # Lazy import
+    # Fetch the player data
+    player = Player.query.filter_by(player_id=player_id).first()
+    if player:
+        return player.to_dict()
+    return {"error": "Player not found"}

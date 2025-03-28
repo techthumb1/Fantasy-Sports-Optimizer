@@ -1,3 +1,5 @@
+import PlayerQuery from '../components/PlayerQuery';
+
 export default function Home() {
   return (
     <>
@@ -40,6 +42,11 @@ export default function Home() {
             Learn how to maximize your team&apos;s performance using our AI-powered tools.
           </p>
         </div>
+
+        <div>
+      <h1>Welcome to Fantasy Sports Optimizer</h1>
+      <PlayerQuery />
+         </div>
 
         <div className="group rounded-lg p-8 transition-colors bg-gray-800 hover:bg-gray-700">
           <h3 className="mb-3 text-2xl font-semibold">

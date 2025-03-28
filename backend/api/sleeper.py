@@ -1,7 +1,7 @@
 import requests
+import logging
 
 class SleeperAPI:
-    
     BASE_URL = "https://api.sleeper.app/v1"
 
     @classmethod
@@ -9,6 +9,7 @@ class SleeperAPI:
         response = requests.get(f"{cls.BASE_URL}/user/{username_or_id}")
         if response.status_code == 200:
             return response.json()
+        logging.error(f"Failed to fetch user {username_or_id}. Status code: {response.status_code}")
         return None
     
     @classmethod
@@ -59,7 +60,19 @@ class SleeperAPI:
         if response.status_code == 200:
             return response.json()
         return None
-    
+
+    @classmethod
+    def handle_response(cls, response):
+        if response.status_code == 200:
+            return response.json()
+        logging.error(f"API call failed: {response.url} | Status Code: {response.status_code}")
+        return None
+
+    @classmethod
+    def get_user(cls, username_or_id):
+        response = requests.get(f"{cls.BASE_URL}/user/{username_or_id}")
+        return cls.handle_response(response)
+
     @classmethod
     def get_players(cls, sport):
         response = requests.get(f"{cls.BASE_URL}/players/{sport}")
