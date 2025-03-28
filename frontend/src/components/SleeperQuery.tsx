@@ -18,12 +18,12 @@ const SleeperQuery: React.FC = () => {
 
     try {
       const response = await fetch(`/api/sleeper/user/${usernameOrId}`);
-      const data: SleeperData = await response.json();
+      const data = await response.json();
 
       if (response.ok) {
-        setSleeperData(data);
+        setSleeperData(data as SleeperData);
       } else {
-        setError(data.error || 'Failed to fetch Sleeper user data');
+        setError(data?.error || 'Failed to fetch Sleeper user data');
       }
     } catch (err) {
       setError('Error fetching Sleeper user data');

@@ -23,7 +23,7 @@ const SportsDataIOQuery: React.FC = () => {
       if (response.ok) {
         setSportsData(data);
       } else {
-        setError(data.error || 'Failed to fetch SportsDataIO player stats');
+        setError('Failed to fetch SportsDataIO player stats');
       }
     } catch (err) {
       setError('Error fetching player stats');
