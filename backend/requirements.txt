@@ -23,7 +23,10 @@ joblib==1.4.2
 keras>=3.9.0
 
 libclang==18.1.1
-lightgbm==4.5.0
+# ⚠️ RCE vulnerability: LightGBM < 4.6.0 allows remote code execution
+# See: https://github.com/microsoft/LightGBM/security/advisories
+lightgbm>=4.6.0
+
 Markdown==3.7
 markdown-it-py==3.0.0
 MarkupSafe==2.1.5
